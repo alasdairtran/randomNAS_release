@@ -1,33 +1,40 @@
-import sys
-sys.path.append('/home/liamli4465/darts/rnn')
-from model import RNNModel
-import genotypes
-import data
-from utils import batchify, get_batch, repackage_hidden, create_exp_dir, save_checkpoint
-
-import time
+import copy
+import gc
+import logging
 import math
+import os
+import sys
+import time
+
 import numpy as np
 import torch
-import copy
-import logging
+import torch.backends.cudnn as cudnn
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.backends.cudnn as cudnn
-import os
-import gc
+
+import data
+import genotypes
+from model import RNNModel
+from utils import (batchify, create_exp_dir, get_batch, repackage_hidden,
+                   save_checkpoint)
+
+sys.path.append('/home/liamli4465/darts/rnn')
+
 
 class AttrDict(dict):
     def __init__(self, *args, **kwargs):
         super(AttrDict, self).__init__(*args, **kwargs)
         self.__dict__ = self
 
+
 class DartsWrapper:
     def __init__(self, save_path, seed, batch_size, grad_clip, config='eval'):
         if config == 'search':
-            args = {'emsize':300, 'nhid':300, 'nhidlast':300, 'dropoute':0, 'wdecay':5e-7}
+            args = {'emsize': 300, 'nhid': 300,
+                    'nhidlast': 300, 'dropoute': 0, 'wdecay': 5e-7}
         elif config == 'eval':
-            args = {'emsize':850, 'nhid':850, 'nhidlast':850, 'dropoute':0.1, 'wdecay':8e-7}
+            args = {'emsize': 850, 'nhid': 850, 'nhidlast': 850,
+                    'dropoute': 0.1, 'wdecay': 8e-7}
         args['config'] = config
 
         args['data'] = '/home/liamli4465/darts/data/penn'
@@ -59,7 +66,7 @@ class DartsWrapper:
         torch.manual_seed(args.seed)
         torch.cuda.set_device(args.gpu)
         cudnn.benchmark = True
-        cudnn.enabled=True
+        cudnn.enabled = True
         torch.cuda.manual_seed_all(args.seed)
 
         corpus = data.Corpus(args.data)
@@ -78,9 +85,8 @@ class DartsWrapper:
         self.total_loss = 0
         self.start_time = time.time()
 
-
         ntokens = len(corpus.dictionary)
-        #if args.continue_train:
+        # if args.continue_train:
         #    model = torch.load(os.path.join(args.save, 'model.pt'))
         try:
             model = torch.load(os.path.join(args.save, 'model.pt'))
@@ -88,7 +94,7 @@ class DartsWrapper:
         except Exception as e:
             print(e)
             model = RNNModel(ntokens, args.emsize, args.nhid, args.nhidlast,
-                   args.dropout, args.dropouth, args.dropoutx, args.dropouti, args.dropoute, genotype=genotypes.DARTS)
+                             args.dropout, args.dropouth, args.dropoutx, args.dropouti, args.dropoute, genotype=genotypes.DARTS)
 
         size = 0
         for p in model.parameters():
@@ -102,7 +108,8 @@ class DartsWrapper:
         logging.info('Model total parameters: {}'.format(total_params))
 
         self.model = model.cuda()
-        self.optimizer = torch.optim.SGD(model.parameters(), lr=args.lr, weight_decay=args.wdecay)
+        self.optimizer = torch.optim.SGD(
+            model.parameters(), lr=args.lr, weight_decay=args.wdecay)
         #self.parallel_model = model.cuda()
 
     def set_model_arch(self, arch):
@@ -124,7 +131,8 @@ class DartsWrapper:
         batch = self.batch
 
         if i == 0:
-            hidden = [model.init_hidden(args.small_batch_size) for _ in range(args.batch_size // args.small_batch_size)]
+            hidden = [model.init_hidden(args.small_batch_size) for _ in range(
+                args.batch_size // args.small_batch_size)]
         else:
             hidden = self.hidden
 
@@ -145,21 +153,27 @@ class DartsWrapper:
 
         start, end, s_id = 0, args.small_batch_size, 0
         while start < args.batch_size:
-            cur_data, cur_targets = data[:, start: end], targets[:, start: end].contiguous().view(-1)
+            cur_data, cur_targets = data[:, start: end], targets[:, start: end].contiguous(
+            ).view(-1)
 
             # assuming small_batch_size = batch_size so we don't accumulate gradients
             optimizer.zero_grad()
             hidden[s_id] = repackage_hidden(hidden[s_id])
 
-            log_prob, hidden[s_id], rnn_hs, dropped_rnn_hs = model(cur_data, hidden[s_id], return_h=True)
-            raw_loss = nn.functional.nll_loss(log_prob.view(-1, log_prob.size(2)), cur_targets)
+            log_prob, hidden[s_id], rnn_hs, dropped_rnn_hs = model(
+                cur_data, hidden[s_id], return_h=True)
+            raw_loss = nn.functional.nll_loss(
+                log_prob.view(-1, log_prob.size(2)), cur_targets)
 
             loss = raw_loss
             # Activiation Regularization
             if args.alpha > 0:
-              loss = loss + sum(args.alpha * dropped_rnn_h.pow(2).mean() for dropped_rnn_h in dropped_rnn_hs[-1:])
+                loss = loss + sum(args.alpha * dropped_rnn_h.pow(2).mean()
+                                  for dropped_rnn_h in dropped_rnn_hs[-1:])
             # Temporal Activation Regularization (slowness)
-            loss = loss + sum(args.beta * (rnn_h[1:] - rnn_h[:-1]).pow(2).mean() for rnn_h in rnn_hs[-1:])
+            loss = loss + \
+                sum(args.beta * (rnn_h[1:] - rnn_h[:-1]
+                                 ).pow(2).mean() for rnn_h in rnn_hs[-1:])
             loss *= args.small_batch_size / args.batch_size
             total_loss += raw_loss.data * args.small_batch_size / args.batch_size
             loss.backward()
@@ -183,9 +197,10 @@ class DartsWrapper:
             elapsed = time.time() - self.start_time
             val_ppl = self.evaluate(arch)
             logging.info('| epoch {:3d} | {:5d}/{:5d} batches | lr {:02.2f} | ms/batch {:5.2f} | '
-                    'loss {:5.2f} | ppl {:8.2f} | val_ppl {:8.2f}'.format(
-                self.epochs, batch % (len(self.train_data) // args.bptt), len(self.train_data) // args.bptt, optimizer.param_groups[0]['lr'],
-                elapsed * 1000 / args.log_interval, cur_loss, math.exp(cur_loss), val_ppl))
+                         'loss {:5.2f} | ppl {:8.2f} | val_ppl {:8.2f}'.format(
+                             self.epochs, batch % (len(self.train_data) // args.bptt), len(
+                                 self.train_data) // args.bptt, optimizer.param_groups[0]['lr'],
+                             elapsed * 1000 / args.log_interval, cur_loss, math.exp(cur_loss), val_ppl))
             total_loss = 0
             self.start_time = time.time()
         self.batch += 1
@@ -196,20 +211,22 @@ class DartsWrapper:
         model = self.model
         #weights = self.get_weights_from_arch(arch)
         self.set_model_arch(arch)
-        #self.set_model_weights(weights)
+        # self.set_model_weights(weights)
         model.eval()
         args = self.args
         total_loss = 0
         ntokens = len(self.corpus.dictionary)
         hidden = model.init_hidden(self.args.search_batch_size)
-        #TODO: change this to take seed so that same minibatch can be used when desired
+        # TODO: change this to take seed so that same minibatch can be used when desired
         #batches = np.random.choice(np.arange(self.search_data.size(0) -1), n_batches, replace=False)
         for i in range(0, self.search_data.size(0) - 1, args.bptt):
-            data, targets = get_batch(self.search_data, i, args, evaluation=True)
+            data, targets = get_batch(
+                self.search_data, i, args, evaluation=True)
             targets = targets.view(-1)
 
             log_prob, hidden = model(data, hidden)
-            loss = nn.functional.nll_loss(log_prob.view(-1, log_prob.size(2)), targets).data
+            loss = nn.functional.nll_loss(
+                log_prob.view(-1, log_prob.size(2)), targets).data
 
             total_loss += loss * len(data)
 
@@ -222,35 +239,34 @@ class DartsWrapper:
         # TODO: add resume functionality
 
     def save(self):
-        save_checkpoint(self.model, self.optimizer, self.epochs, self.args.save)
+        save_checkpoint(self.model, self.optimizer,
+                        self.epochs, self.args.save)
 
     def sample_arch(self):
         n_nodes = genotypes.STEPS
         n_ops = len(genotypes.PRIMITIVES)
         arch = []
         for i in range(n_nodes):
-            op = np.random.choice(range(1,n_ops))
+            op = np.random.choice(range(1, n_ops))
             node_in = np.random.choice(range(i+1))
             arch.append((genotypes.PRIMITIVES[op], node_in))
         #concat = [i for i in range(genotypes.STEPS) if i not in [j[1] for j in arch]]
-        concat = range(1,9)
+        concat = range(1, 9)
         genotype = genotypes.Genotype(recurrent=arch, concat=concat)
         return genotype
 
-
     def perturb_arch(self, arch):
         new_arch = copy.deepcopy(arch)
-        p = np.arange(1,genotypes.STEPS+1)
+        p = np.arange(1, genotypes.STEPS+1)
         p = p / sum(p)
         c_ind = np.random.choice(genotypes.STEPS, p=p)
         #c_ind = np.random.choice(genotypes.STEPS)
-        new_op = np.random.choice(range(1,len(genotypes.PRIMITIVES)))
+        new_op = np.random.choice(range(1, len(genotypes.PRIMITIVES)))
         new_in = np.random.choice(range(c_ind+1))
         new_arch.recurrent[c_ind] = (genotypes.PRIMITIVES[new_op], new_in)
-        #print(arch)
+        # print(arch)
         #arch.recurrent[c_ind] = (arch.recurrent[c_ind][0],new_in)
         return new_arch
-
 
     def get_weights_from_arch(self, arch):
         n_nodes = genotypes.STEPS
@@ -268,4 +284,3 @@ class DartsWrapper:
         weights = torch.autograd.Variable(weights.cuda(), requires_grad=False)
 
         return weights
-

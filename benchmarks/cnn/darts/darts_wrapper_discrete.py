@@ -1,28 +1,32 @@
-import sys
-sys.path.append('/home/liamli4465/darts/cnn')
-import genotypes
-from model_search import Network
-import utils
-
-import time
-import math
 import copy
-import random
-import logging
-import os
 import gc
+import logging
+import math
+import os
+import random
+import sys
+import time
+
 import numpy as np
 import torch
-from torch.autograd import Variable
-import torchvision.datasets as dset
+import torch.backends.cudnn as cudnn
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.backends.cudnn as cudnn
+import torchvision.datasets as dset
+from torch.autograd import Variable
+
+import genotypes
+import utils
+from model_search import Network
+
+sys.path.append('/home/liamli4465/darts/cnn')
+
 
 class AttrDict(dict):
     def __init__(self, *args, **kwargs):
         super(AttrDict, self).__init__(*args, **kwargs)
         self.__dict__ = self
+
 
 class DartsWrapper:
     def __init__(self, save_path, seed, batch_size, grad_clip, epochs, resume_iter=None, init_channels=16):
@@ -56,27 +60,29 @@ class DartsWrapper:
         torch.manual_seed(args.seed)
         torch.cuda.set_device(args.gpu)
         cudnn.benchmark = False
-        cudnn.enabled=True
-        cudnn.deterministic=True
+        cudnn.enabled = True
+        cudnn.deterministic = True
         torch.cuda.manual_seed_all(args.seed)
 
-
         train_transform, valid_transform = utils._data_transforms_cifar10(args)
-        train_data = dset.CIFAR10(root=args.data, train=True, download=False, transform=train_transform)
+        train_data = dset.CIFAR10(
+            root=args.data, train=True, download=False, transform=train_transform)
 
         num_train = len(train_data)
         indices = list(range(num_train))
         split = int(np.floor(args.train_portion * num_train))
 
         self.train_queue = torch.utils.data.DataLoader(
-          train_data, batch_size=args.batch_size,
-          sampler=torch.utils.data.sampler.SubsetRandomSampler(indices[:split]),
-          pin_memory=True, num_workers=0, worker_init_fn=np.random.seed(args.seed))
+            train_data, batch_size=args.batch_size,
+            sampler=torch.utils.data.sampler.SubsetRandomSampler(
+                indices[:split]),
+            pin_memory=True, num_workers=0, worker_init_fn=np.random.seed(args.seed))
 
         self.valid_queue = torch.utils.data.DataLoader(
-          train_data, batch_size=args.batch_size,
-          sampler=torch.utils.data.sampler.SubsetRandomSampler(indices[split:num_train]),
-          pin_memory=True, num_workers=0, worker_init_fn=np.random.seed(args.seed))
+            train_data, batch_size=args.batch_size,
+            sampler=torch.utils.data.sampler.SubsetRandomSampler(
+                indices[split:num_train]),
+            pin_memory=True, num_workers=0, worker_init_fn=np.random.seed(args.seed))
 
         self.train_iter = iter(self.train_queue)
         self.valid_iter = iter(self.valid_queue)
@@ -103,14 +109,14 @@ class DartsWrapper:
         logging.info("param size = %fMB", utils.count_parameters_in_MB(model))
 
         optimizer = torch.optim.SGD(
-          self.model.parameters(),
-          args.learning_rate,
-          momentum=args.momentum,
-          weight_decay=args.weight_decay)
+            self.model.parameters(),
+            args.learning_rate,
+            momentum=args.momentum,
+            weight_decay=args.weight_decay)
         self.optimizer = optimizer
 
         self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-          optimizer, float(args.epochs), eta_min=args.learning_rate_min)
+            optimizer, float(args.epochs), eta_min=args.learning_rate_min)
 
         if resume_iter is not None:
             self.steps = resume_iter
@@ -132,91 +138,94 @@ class DartsWrapper:
         logging.info('Model total parameters: {}'.format(total_params))
 
     def train_batch(self, arch):
-      args = self.args
-      if self.steps % len(self.train_queue) == 0:
-        self.scheduler.step()
-        self.objs = utils.AvgrageMeter()
-        self.top1 = utils.AvgrageMeter()
-        self.top5 = utils.AvgrageMeter()
-      lr = self.scheduler.get_lr()[0]
+        args = self.args
+        if self.steps % len(self.train_queue) == 0:
+            self.scheduler.step()
+            self.objs = utils.AvgrageMeter()
+            self.top1 = utils.AvgrageMeter()
+            self.top5 = utils.AvgrageMeter()
+        lr = self.scheduler.get_lr()[0]
 
-      weights = self.get_weights_from_arch(arch)
-      self.set_model_weights(weights)
+        weights = self.get_weights_from_arch(arch)
+        self.set_model_weights(weights)
 
-      step = self.steps % len(self.train_queue)
-      input, target = next(self.train_iter)
+        step = self.steps % len(self.train_queue)
+        input, target = next(self.train_iter)
 
-      self.model.train()
-      n = input.size(0)
+        self.model.train()
+        n = input.size(0)
 
-      input = Variable(input, requires_grad=False).cuda()
-      target = Variable(target, requires_grad=False).cuda(async=True)
+        input = Variable(input, requires_grad=False).cuda()
+        target = Variable(target, requires_grad=False).cuda(async=True)
 
-      # get a random minibatch from the search queue with replacement
-      self.optimizer.zero_grad()
-      logits = self.model(input, discrete=True)
-      loss = self.criterion(logits, target)
-
-      loss.backward()
-      nn.utils.clip_grad_norm(self.model.parameters(), args.grad_clip)
-      self.optimizer.step()
-
-      prec1, prec5 = utils.accuracy(logits, target, topk=(1, 5))
-      self.objs.update(loss.data[0], n)
-      self.top1.update(prec1.data[0], n)
-      self.top5.update(prec5.data[0], n)
-
-      if step % args.report_freq == 0:
-        logging.info('train %03d %e %f %f', step, self.objs.avg, self.top1.avg, self.top5.avg)
-
-      self.steps += 1
-      if self.steps % len(self.train_queue) == 0:
-        self.epochs += 1
-        self.train_iter = iter(self.train_queue)
-        valid_err = self.evaluate(arch)
-        logging.info('epoch %d  |  train_acc %f  |  valid_acc %f' % (self.epochs, self.top1.avg, 1-valid_err))
-        self.save()
-
-    def evaluate(self, arch, split=None):
-      # Return error since we want to minimize obj val
-      logging.info(arch)
-      objs = utils.AvgrageMeter()
-      top1 = utils.AvgrageMeter()
-      top5 = utils.AvgrageMeter()
-
-      weights = self.get_weights_from_arch(arch)
-      self.set_model_weights(weights)
-
-      self.model.eval()
-
-      if split is None:
-        n_batches = 10
-      else:
-        n_batches = len(self.valid_queue)
-
-      for step in range(n_batches):
-        try:
-          input, target = next(self.valid_iter)
-        except Exception as e:
-          logging.info('looping back over valid set')
-          self.valid_iter = iter(self.valid_queue)
-          input, target = next(self.valid_iter)
-        input = Variable(input, volatile=True).cuda()
-        target = Variable(target, volatile=True).cuda(async=True)
-
+        # get a random minibatch from the search queue with replacement
+        self.optimizer.zero_grad()
         logits = self.model(input, discrete=True)
         loss = self.criterion(logits, target)
 
+        loss.backward()
+        nn.utils.clip_grad_norm(self.model.parameters(), args.grad_clip)
+        self.optimizer.step()
+
         prec1, prec5 = utils.accuracy(logits, target, topk=(1, 5))
-        n = input.size(0)
-        objs.update(loss.data[0], n)
-        top1.update(prec1.data[0], n)
-        top5.update(prec5.data[0], n)
+        self.objs.update(loss.data[0], n)
+        self.top1.update(prec1.data[0], n)
+        self.top5.update(prec5.data[0], n)
 
-        if step % self.args.report_freq == 0:
-          logging.info('valid %03d %e %f %f', step, objs.avg, top1.avg, top5.avg)
+        if step % args.report_freq == 0:
+            logging.info('train %03d %e %f %f', step,
+                         self.objs.avg, self.top1.avg, self.top5.avg)
 
-      return 1-top1.avg
+        self.steps += 1
+        if self.steps % len(self.train_queue) == 0:
+            self.epochs += 1
+            self.train_iter = iter(self.train_queue)
+            valid_err = self.evaluate(arch)
+            logging.info('epoch %d  |  train_acc %f  |  valid_acc %f' %
+                         (self.epochs, self.top1.avg, 1-valid_err))
+            self.save()
+
+    def evaluate(self, arch, split=None):
+        # Return error since we want to minimize obj val
+        logging.info(arch)
+        objs = utils.AvgrageMeter()
+        top1 = utils.AvgrageMeter()
+        top5 = utils.AvgrageMeter()
+
+        weights = self.get_weights_from_arch(arch)
+        self.set_model_weights(weights)
+
+        self.model.eval()
+
+        if split is None:
+            n_batches = 10
+        else:
+            n_batches = len(self.valid_queue)
+
+        for step in range(n_batches):
+            try:
+                input, target = next(self.valid_iter)
+            except Exception as e:
+                logging.info('looping back over valid set')
+                self.valid_iter = iter(self.valid_queue)
+                input, target = next(self.valid_iter)
+            input = Variable(input, volatile=True).cuda()
+            target = Variable(target, volatile=True).cuda(async=True)
+
+            logits = self.model(input, discrete=True)
+            loss = self.criterion(logits, target)
+
+            prec1, prec5 = utils.accuracy(logits, target, topk=(1, 5))
+            n = input.size(0)
+            objs.update(loss.data[0], n)
+            top1.update(prec1.data[0], n)
+            top5.update(prec5.data[0], n)
+
+            if step % self.args.report_freq == 0:
+                logging.info('valid %03d %e %f %f', step,
+                             objs.avg, top1.avg, top5.avg)
+
+        return 1-top1.avg
 
     def save(self):
         utils.save(self.model, os.path.join(self.args.save, 'weights.pt'))
@@ -229,8 +238,10 @@ class DartsWrapper:
         num_ops = len(genotypes.PRIMITIVES)
         n_nodes = self.model._steps
 
-        alphas_normal = Variable(torch.zeros(k, num_ops).cuda(), requires_grad=False)
-        alphas_reduce = Variable(torch.zeros(k, num_ops).cuda(), requires_grad=False)
+        alphas_normal = Variable(torch.zeros(
+            k, num_ops).cuda(), requires_grad=False)
+        alphas_reduce = Variable(torch.zeros(
+            k, num_ops).cuda(), requires_grad=False)
 
         offset = 0
         for i in range(n_nodes):
@@ -245,15 +256,16 @@ class DartsWrapper:
             offset += (i+2)
 
         arch_parameters = [
-          alphas_normal,
-          alphas_reduce,
+            alphas_normal,
+            alphas_reduce,
         ]
         return arch_parameters
 
     def set_model_weights(self, weights):
-      self.model.alphas_normal = weights[0]
-      self.model.alphas_reduce = weights[1]
-      self.model._arch_parameters = [self.model.alphas_normal, self.model.alphas_reduce]
+        self.model.alphas_normal = weights[0]
+        self.model.alphas_reduce = weights[1]
+        self.model._arch_parameters = [
+            self.model.alphas_normal, self.model.alphas_reduce]
 
     def sample_arch(self):
         k = sum(1 for i in range(self.model._steps) for n in range(2+i))
@@ -266,11 +278,12 @@ class DartsWrapper:
             ops = np.random.choice(range(num_ops), 4)
             nodes_in_normal = np.random.choice(range(i+2), 2, replace=False)
             nodes_in_reduce = np.random.choice(range(i+2), 2, replace=False)
-            normal.extend([(nodes_in_normal[0], ops[0]), (nodes_in_normal[1], ops[1])])
-            reduction.extend([(nodes_in_reduce[0], ops[2]), (nodes_in_reduce[1], ops[3])])
+            normal.extend([(nodes_in_normal[0], ops[0]),
+                           (nodes_in_normal[1], ops[1])])
+            reduction.extend([(nodes_in_reduce[0], ops[2]),
+                              (nodes_in_reduce[1], ops[3])])
 
         return (normal, reduction)
-
 
     def perturb_arch(self, arch):
         new_arch = copy.deepcopy(arch)
@@ -284,5 +297,3 @@ class DartsWrapper:
         new_arch[cell_ind][2*step_ind] = (nodes_in[0], ops[0])
         new_arch[cell_ind][2*step_ind+1] = (nodes_in[1], ops[1])
         return new_arch
-
-
